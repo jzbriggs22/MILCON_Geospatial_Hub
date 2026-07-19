@@ -1,7 +1,6 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgdal-dev \
     libgeos-dev \
     libproj-dev \
     gcc \
@@ -10,11 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /opt/app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e ".[dev]"
-
+# Install the package (and dependencies) after copying source — an editable
+# install cannot run before app/ exists.  To cache the dependency layer
+# separately, export a requirements file (pip-compile) and install it first.
 COPY . .
-
 RUN pip install --no-cache-dir -e ".[dev]"
 
 EXPOSE 8501

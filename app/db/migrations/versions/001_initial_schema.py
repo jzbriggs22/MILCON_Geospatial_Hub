@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(200), nullable=False),
         sa.Column("region", sa.String(100), nullable=False),
         sa.Column("readiness_score", sa.Float, nullable=False),
-        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326), nullable=False),
+        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326, spatial_index=False), nullable=False),
         sa.CheckConstraint("readiness_score >= 0 AND readiness_score <= 100"),
     )
     op.create_index("idx_installations_geom", "installations", ["geometry"], postgresql_using="gist")
@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.Column("installation_id", sa.Integer, sa.ForeignKey("installations.id", ondelete="CASCADE"), nullable=False),
         sa.Column("type", sa.String(100), nullable=False),
         sa.Column("condition_index", sa.Float, nullable=False),
-        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326), nullable=False),
+        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326, spatial_index=False), nullable=False),
         sa.CheckConstraint("condition_index >= 0 AND condition_index <= 100"),
     )
     op.create_index("idx_facilities_geom", "facilities", ["geometry"], postgresql_using="gist")
@@ -55,7 +55,7 @@ def upgrade() -> None:
         sa.Column("benefit_estimate", sa.Float, nullable=False),
         sa.Column("priority", sa.Integer, nullable=False),
         sa.Column("year", sa.Integer, nullable=False),
-        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326), nullable=False),
+        sa.Column("geometry", geoalchemy2.Geometry("POINT", srid=4326, spatial_index=False), nullable=False),
         sa.CheckConstraint("cost_estimate > 0"),
         sa.CheckConstraint("benefit_estimate >= 0"),
         sa.CheckConstraint("priority >= 1 AND priority <= 5"),
@@ -70,7 +70,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("type", sa.String(50), nullable=False),
         sa.Column("severity", sa.Float, nullable=False),
-        sa.Column("geometry", geoalchemy2.Geometry("POLYGON", srid=4326), nullable=False),
+        sa.Column("geometry", geoalchemy2.Geometry("POLYGON", srid=4326, spatial_index=False), nullable=False),
         sa.CheckConstraint("severity >= 0 AND severity <= 10"),
     )
     op.create_index("idx_hazards_geom", "hazards", ["geometry"], postgresql_using="gist")
@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("type", sa.String(100), nullable=False),
         sa.Column("notes", sa.Text, nullable=True),
-        sa.Column("geometry", geoalchemy2.Geometry("POLYGON", srid=4326), nullable=False),
+        sa.Column("geometry", geoalchemy2.Geometry("POLYGON", srid=4326, spatial_index=False), nullable=False),
     )
     op.create_index("idx_constraints_geom", "constraints", ["geometry"], postgresql_using="gist")
 

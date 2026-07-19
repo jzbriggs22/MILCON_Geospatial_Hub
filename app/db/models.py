@@ -38,7 +38,7 @@ class Installation(Base):
         CheckConstraint("readiness_score >= 0 AND readiness_score <= 100"),
         nullable=False,
     )
-    geometry = mapped_column(Geometry("POINT", srid=4326), nullable=False)
+    geometry = mapped_column(Geometry("POINT", srid=4326, spatial_index=False), nullable=False)
 
     facilities: Mapped[list[Facility]] = relationship(back_populates="installation")
     projects: Mapped[list[Project]] = relationship(back_populates="installation")
@@ -62,7 +62,7 @@ class Facility(Base):
         CheckConstraint("condition_index >= 0 AND condition_index <= 100"),
         nullable=False,
     )
-    geometry = mapped_column(Geometry("POINT", srid=4326), nullable=False)
+    geometry = mapped_column(Geometry("POINT", srid=4326, spatial_index=False), nullable=False)
 
     installation: Mapped[Installation] = relationship(back_populates="facilities")
 
@@ -90,7 +90,7 @@ class Project(Base):
         Integer, CheckConstraint("priority >= 1 AND priority <= 5"), nullable=False
     )
     year: Mapped[int] = mapped_column(Integer, nullable=False)
-    geometry = mapped_column(Geometry("POINT", srid=4326), nullable=False)
+    geometry = mapped_column(Geometry("POINT", srid=4326, spatial_index=False), nullable=False)
 
     installation: Mapped[Installation] = relationship(back_populates="projects")
 
@@ -111,7 +111,7 @@ class Hazard(Base):
         CheckConstraint("severity >= 0 AND severity <= 10"),
         nullable=False,
     )
-    geometry = mapped_column(Geometry("POLYGON", srid=4326), nullable=False)
+    geometry = mapped_column(Geometry("POLYGON", srid=4326, spatial_index=False), nullable=False)
 
     __table_args__ = (
         Index("idx_hazards_geom", "geometry", postgresql_using="gist"),
@@ -124,7 +124,7 @@ class Constraint(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     type: Mapped[str] = mapped_column(String(100), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    geometry = mapped_column(Geometry("POLYGON", srid=4326), nullable=False)
+    geometry = mapped_column(Geometry("POLYGON", srid=4326, spatial_index=False), nullable=False)
 
     __table_args__ = (
         Index("idx_constraints_geom", "geometry", postgresql_using="gist"),

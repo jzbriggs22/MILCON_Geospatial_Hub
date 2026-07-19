@@ -3,51 +3,74 @@
 Every query is stored as a named constant so that:
 1. Reports can reference the exact SQL executed.
 2. Auditors can verify that scoring logic matches documentation.
-3. The same queries appear in sql/views_and_functions.sql for cross-reference.
+3. sql/views_and_functions.sql mirrors the view definitions for
+   cross-reference (consistency enforced by tests/test_sql_reference.py).
 
 All queries use bind parameters (`:param`) — never string interpolation.
 """
+
+# Materialized views only contain pairs within this radius (see migration 002).
+# Query-time buffers must not exceed it.
+MAX_PROXIMITY_RADIUS_M = 10_000
 
 # ---------------------------------------------------------------------------
 # RAW_FACTORS_QUERY
 # ---------------------------------------------------------------------------
 # Pulls un-normalized scoring factors for all projects in a given year.
 #
-# Inputs:
-#   :year — analysis year (integer)
-#   :hazard_severity_mult — scenario multiplier for hazard severity (float)
+# Bind parameters:
+#   :year                — analysis year (integer)
+#   :hazard_buffer_m     — hazard proximity radius in meters (float)
+#   :constraint_buffer_m — constraint proximity radius in meters (float);
+#                          0 reproduces plain-intersection semantics
 #
-# Source tables:
-#   project_risk_exposure   (materialized view, from projects + hazards)
-#   project_constraint_flags (materialized view, from projects + constraints)
-#   installations
+# Source tables/views:
+#   projects, installations (base tables — new projects always appear)
+#   project_hazard_proximity, project_constraint_proximity
+#     (materialized views of pairwise distances in meters; migration 002)
 #
 # Columns returned:
 #   project_id, installation_id, category, cost_estimate, benefit_estimate,
-#   readiness_score, readiness_gap, roi, hazard_exposure,
-#   is_constrained, constraint_count
+#   year, readiness_score, readiness_gap, roi, max_hazard_severity,
+#   hazard_count, is_constrained, constraint_count
 # ---------------------------------------------------------------------------
 RAW_FACTORS_QUERY = """
 SELECT
-    pre.project_id,
-    pre.installation_id,
-    pre.category,
-    pre.cost_estimate,
-    pre.benefit_estimate,
+    p.id AS project_id,
+    p.installation_id,
+    p.category,
+    p.cost_estimate,
+    p.benefit_estimate,
+    p.year,
     i.readiness_score,
     (100.0 - i.readiness_score)                      AS readiness_gap,
-    CASE WHEN pre.cost_estimate > 0
-         THEN pre.benefit_estimate / pre.cost_estimate
+    CASE WHEN p.cost_estimate > 0
+         THEN p.benefit_estimate / p.cost_estimate
          ELSE 0 END                                   AS roi,
-    pre.max_hazard_severity * :hazard_severity_mult    AS hazard_exposure,
-    pre.hazard_count,
-    pcf.is_constrained,
-    pcf.constraint_count
-FROM project_risk_exposure pre
-JOIN installations i        ON i.id = pre.installation_id
-JOIN project_constraint_flags pcf ON pcf.project_id = pre.project_id
-WHERE pre.year = :year
-ORDER BY pre.project_id
+    COALESCE(hz.max_severity, 0)                      AS max_hazard_severity,
+    COALESCE(hz.hazard_count, 0)                      AS hazard_count,
+    CASE WHEN COALESCE(cz.constraint_count, 0) > 0
+         THEN 1 ELSE 0 END                            AS is_constrained,
+    COALESCE(cz.constraint_count, 0)                  AS constraint_count
+FROM projects p
+JOIN installations i ON i.id = p.installation_id
+LEFT JOIN (
+    SELECT project_id,
+           MAX(severity) AS max_severity,
+           COUNT(*)      AS hazard_count
+    FROM project_hazard_proximity
+    WHERE distance_m <= :hazard_buffer_m
+    GROUP BY project_id
+) hz ON hz.project_id = p.id
+LEFT JOIN (
+    SELECT project_id,
+           COUNT(*) AS constraint_count
+    FROM project_constraint_proximity
+    WHERE distance_m <= :constraint_buffer_m
+    GROUP BY project_id
+) cz ON cz.project_id = p.id
+WHERE p.year = :year
+ORDER BY p.id
 """
 
 # ---------------------------------------------------------------------------
@@ -58,7 +81,7 @@ SELECT year, capex_limit FROM budgets WHERE year = :year
 """
 
 # ---------------------------------------------------------------------------
-# INSTALLATION_SUMMARY
+# INSTALLATION_SUMMARY_QUERY
 # ---------------------------------------------------------------------------
 INSTALLATION_SUMMARY_QUERY = """
 SELECT
@@ -116,7 +139,12 @@ ORDER BY p.id
 """
 
 # ---------------------------------------------------------------------------
-# REFRESH_MATERIALIZED_VIEWS
+# Materialized view refresh — single source of truth.
+# Plain (non-CONCURRENT) refresh: correct on both populated and fresh views,
+# and faster for full reloads.  Called via
+# app.db.maintenance.refresh_analytics_views().
 # ---------------------------------------------------------------------------
-REFRESH_MV_RISK = "REFRESH MATERIALIZED VIEW CONCURRENTLY project_risk_exposure"
-REFRESH_MV_CONSTRAINTS = "REFRESH MATERIALIZED VIEW CONCURRENTLY project_constraint_flags"
+REFRESH_STATEMENTS = (
+    "REFRESH MATERIALIZED VIEW project_hazard_proximity",
+    "REFRESH MATERIALIZED VIEW project_constraint_proximity",
+)

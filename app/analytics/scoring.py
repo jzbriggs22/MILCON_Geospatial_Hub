@@ -3,36 +3,57 @@
 Scoring pipeline
 ================
 1. Execute RAW_FACTORS_QUERY against PostGIS to get un-normalized factors.
-2. Apply min-max normalization so each factor ∈ [0, 1].
-3. Compute multi-objective score using scenario weights:
+   Hazard and constraint proximity buffers are bind parameters (meters),
+   so scenario buffers genuinely change the spatial inputs.
+2. Normalize each factor to [0, 1]:
 
-       score = w_readiness * readiness_gap_norm
-             + w_roi       * roi_norm
-             - w_risk      * hazard_exposure_norm
+   - readiness_gap_norm      = readiness_gap / 100
+       (domain-anchored: readiness_score is defined on [0, 100])
+   - hazard_exposure_norm    = clip(max_hazard_severity
+                                    * hazard_severity_multiplier / 10, 0, 1)
+       (domain-anchored: severity is defined on [0, 10]; the scenario
+        multiplier therefore genuinely shifts the normalized value)
+   - roi_norm                = min-max over the project cohort
+       (ROI has no natural upper bound; NOTE this makes roi_norm — and any
+        score built on it — comparable only within a single run's cohort)
+   - constraint_penalty_norm = is_constrained * min(constraint_count/5, 1)
+
+3. Compute the multi-objective score using scenario weights:
+
+       score = w_readiness  * readiness_gap_norm
+             + w_roi        * roi_norm
+             - w_risk       * hazard_exposure_norm
              - w_constraint * constraint_penalty_norm
-
-4. Return a DataFrame with all raw and normalized values plus the score.
 
 Auditability
 ============
-- The exact SQL query is stored in analytics.queries.RAW_FACTORS_QUERY.
+- The exact SQL is analytics.queries.RAW_FACTORS_QUERY; the bind parameters
+  actually passed (including both buffers) are recorded in the result.
 - Scenario weights come from config.SCENARIOS[scenario_name].
-- Normalization bounds (min/max per column) are returned alongside results.
-- Every row includes the raw factor values so the score can be recomputed
-  by hand.
+- Normalization bounds per factor are returned alongside results.
+- Every row keeps its raw factor values so the score can be recomputed by hand.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.analytics.queries import RAW_FACTORS_QUERY, BUDGET_QUERY
+from app.analytics.queries import (
+    BUDGET_QUERY,
+    MAX_PROXIMITY_RADIUS_M,
+    RAW_FACTORS_QUERY,
+)
 from app.config import AnalysisConfig, ScenarioWeights
+
+# Severity is defined on [0, 10] (see hazards.severity CHECK constraint).
+SEVERITY_DOMAIN_MAX = 10.0
+# Constraint counts at or above this saturate the penalty at 1.0.
+CONSTRAINT_COUNT_SATURATION = 5.0
 
 
 @dataclass
@@ -66,17 +87,31 @@ def score_projects(session: Session, config: AnalysisConfig) -> ScoringResult:
 
     Args:
         session: Active SQLAlchemy session connected to PostGIS.
-        config:  Analysis configuration (scenario, year, etc.).
+        config:  Analysis configuration (scenario, year, buffers).
 
     Returns:
         ScoringResult with everything needed for audit.
+
+    Raises:
+        ValueError: if a buffer exceeds the materialized proximity radius.
     """
     weights: ScenarioWeights = config.weights
+
+    hazard_buffer_m = config.hazard_buffer_m
+    constraint_buffer_m = weights.constraint_buffer_m
+    for name, value in (("hazard_buffer_m", hazard_buffer_m),
+                        ("constraint_buffer_m", constraint_buffer_m)):
+        if value > MAX_PROXIMITY_RADIUS_M:
+            raise ValueError(
+                f"{name}={value} exceeds materialized proximity radius "
+                f"{MAX_PROXIMITY_RADIUS_M} m; widen the views in migration 002 first"
+            )
 
     # -- Step 1: fetch raw factors from PostGIS -----------------------------
     params = {
         "year": config.year,
-        "hazard_severity_mult": weights.hazard_severity_multiplier,
+        "hazard_buffer_m": hazard_buffer_m,
+        "constraint_buffer_m": constraint_buffer_m,
     }
     df = pd.read_sql(text(RAW_FACTORS_QUERY), session.connection(), params=params)
 
@@ -90,21 +125,32 @@ def score_projects(session: Session, config: AnalysisConfig) -> ScoringResult:
             projects_df=df,
         )
 
-    # -- Step 2: min-max normalization --------------------------------------
-    norm_cols = {
-        "readiness_gap": "readiness_gap_norm",
-        "roi": "roi_norm",
-        "hazard_exposure": "hazard_exposure_norm",
-    }
+    # -- Step 2: normalization ----------------------------------------------
     bounds: dict[str, dict[str, float]] = {}
-    for raw_col, norm_col in norm_cols.items():
-        bounds[raw_col] = {"min": float(df[raw_col].min()), "max": float(df[raw_col].max())}
-        df[norm_col] = _minmax(df[raw_col])
 
-    # Constraint penalty: binary (0 or 1), weighted by count
+    # Domain-anchored: readiness gap lives on [0, 100] by table constraint.
+    df["readiness_gap_norm"] = df["readiness_gap"] / 100.0
+    bounds["readiness_gap"] = {"min": 0.0, "max": 100.0}
+
+    # Domain-anchored: severity lives on [0, 10]; the scenario multiplier
+    # scales exposure within (and up to saturation of) that domain.
+    df["hazard_exposure"] = (
+        df["max_hazard_severity"] * weights.hazard_severity_multiplier
+    )
+    df["hazard_exposure_norm"] = (
+        df["hazard_exposure"] / SEVERITY_DOMAIN_MAX
+    ).clip(0.0, 1.0)
+    bounds["hazard_exposure"] = {"min": 0.0, "max": SEVERITY_DOMAIN_MAX}
+
+    # Cohort-relative: ROI has no natural upper bound.
+    bounds["roi"] = {"min": float(df["roi"].min()), "max": float(df["roi"].max())}
+    df["roi_norm"] = _minmax(df["roi"])
+
+    # Domain-anchored: penalty saturates at CONSTRAINT_COUNT_SATURATION zones.
     df["constraint_penalty_norm"] = (
         df["is_constrained"].astype(float)
-        * df["constraint_count"].clip(upper=5) / 5.0
+        * df["constraint_count"].clip(upper=CONSTRAINT_COUNT_SATURATION)
+        / CONSTRAINT_COUNT_SATURATION
     )
     bounds["constraint_penalty"] = {"min": 0.0, "max": 1.0}
 

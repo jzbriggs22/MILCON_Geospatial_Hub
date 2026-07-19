@@ -4,12 +4,20 @@ Revision ID: 002
 Revises: 001
 Create Date: 2026-02-20
 
-The project_risk_exposure materialized view pre-computes the spatial join
-between projects and hazard buffers, avoiding repeated ST_DWithin calls
-during scoring.  The view is deterministic: for the same input data, the
-same rows are produced.
+Design
+======
+The proximity views pre-compute pairwise project↔hazard and
+project↔constraint distances in METERS (geography cast, so distances are
+true meters and isotropic — no degrees/latitude distortion) for all pairs
+within MAX_PROXIMITY_RADIUS_M.  Scenario-specific buffer distances are then
+applied at query time as bind parameters (`distance_m <= :buffer_m`),
+so the same materialized data serves every scenario without re-computation.
 
-SQL audit note: The exact query is embedded below.
+A pair at distance 0 intersects (geography distance 0 ⇔ ST_Intersects),
+so a constraint buffer of 0 m reproduces plain intersection semantics.
+
+Auditability: the exact SQL is embedded below and mirrored in
+sql/views_and_functions.sql (consistency enforced by tests/test_sql_reference.py).
 """
 
 from typing import Sequence, Union
@@ -21,59 +29,54 @@ down_revision: Union[str, None] = "001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# ---------------------------------------------------------------------------
-# Materialized view: project_risk_exposure
-#
-# For each project, computes the maximum hazard severity within 0.01 degrees
-# (~1 km at mid-latitudes).  Projects with no nearby hazard get severity 0.
-#
-# Inputs:  projects, hazards
-# Spatial op: ST_DWithin(projects.geometry, hazards.geometry, 0.01)
-# ---------------------------------------------------------------------------
-MV_PROJECT_RISK = """
-CREATE MATERIALIZED VIEW IF NOT EXISTS project_risk_exposure AS
+# Pairs beyond this distance are not materialized; query-time buffers must
+# not exceed it (enforced in app/analytics/scoring.py).
+MAX_PROXIMITY_RADIUS_M = 10_000
+
+MV_HAZARD_PROXIMITY = f"""
+CREATE MATERIALIZED VIEW project_hazard_proximity AS
 SELECT
     p.id AS project_id,
-    p.installation_id,
-    p.category,
-    p.cost_estimate,
-    p.benefit_estimate,
-    p.year,
-    COALESCE(MAX(h.severity), 0) AS max_hazard_severity,
-    COUNT(h.id) AS hazard_count
+    h.id AS hazard_id,
+    h.type AS hazard_type,
+    h.severity,
+    ST_Distance(p.geometry::geography, h.geometry::geography) AS distance_m
 FROM projects p
-LEFT JOIN hazards h
-    ON ST_DWithin(p.geometry, h.geometry, 0.01)
-GROUP BY p.id, p.installation_id, p.category, p.cost_estimate, p.benefit_estimate, p.year
+JOIN hazards h
+    ON ST_DWithin(p.geometry::geography, h.geometry::geography, {MAX_PROXIMITY_RADIUS_M})
 """
 
-# ---------------------------------------------------------------------------
-# Materialized view: project_constraint_flags
-#
-# Flags projects that intersect any constraint polygon (optionally buffered).
-# ---------------------------------------------------------------------------
-MV_PROJECT_CONSTRAINTS = """
-CREATE MATERIALIZED VIEW IF NOT EXISTS project_constraint_flags AS
+MV_CONSTRAINT_PROXIMITY = f"""
+CREATE MATERIALIZED VIEW project_constraint_proximity AS
 SELECT
     p.id AS project_id,
-    CASE WHEN COUNT(c.id) > 0 THEN 1 ELSE 0 END AS is_constrained,
-    COUNT(c.id) AS constraint_count,
-    ARRAY_AGG(DISTINCT c.type) FILTER (WHERE c.id IS NOT NULL) AS constraint_types
+    c.id AS constraint_id,
+    c.type AS constraint_type,
+    ST_Distance(p.geometry::geography, c.geometry::geography) AS distance_m
 FROM projects p
-LEFT JOIN constraints c
-    ON ST_Intersects(p.geometry, c.geometry)
-GROUP BY p.id
+JOIN constraints c
+    ON ST_DWithin(p.geometry::geography, c.geometry::geography, {MAX_PROXIMITY_RADIUS_M})
 """
 
 
 def upgrade() -> None:
-    op.execute(MV_PROJECT_RISK)
-    op.execute("CREATE UNIQUE INDEX idx_prisk_project ON project_risk_exposure (project_id)")
+    op.execute(MV_HAZARD_PROXIMITY)
+    op.execute(
+        "CREATE UNIQUE INDEX idx_phaz_pair ON project_hazard_proximity (project_id, hazard_id)"
+    )
+    op.execute(
+        "CREATE INDEX idx_phaz_project_dist ON project_hazard_proximity (project_id, distance_m)"
+    )
 
-    op.execute(MV_PROJECT_CONSTRAINTS)
-    op.execute("CREATE UNIQUE INDEX idx_pcflag_project ON project_constraint_flags (project_id)")
+    op.execute(MV_CONSTRAINT_PROXIMITY)
+    op.execute(
+        "CREATE UNIQUE INDEX idx_pcon_pair ON project_constraint_proximity (project_id, constraint_id)"
+    )
+    op.execute(
+        "CREATE INDEX idx_pcon_project_dist ON project_constraint_proximity (project_id, distance_m)"
+    )
 
 
 def downgrade() -> None:
-    op.execute("DROP MATERIALIZED VIEW IF EXISTS project_constraint_flags")
-    op.execute("DROP MATERIALIZED VIEW IF EXISTS project_risk_exposure")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS project_constraint_proximity")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS project_hazard_proximity")

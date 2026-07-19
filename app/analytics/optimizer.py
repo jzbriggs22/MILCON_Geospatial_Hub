@@ -30,7 +30,7 @@ Auditability
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -100,16 +100,16 @@ def optimize_budget(scoring: ScoringResult) -> OptimizationResult:
     trace: list[dict] = []
     cumulative = 0.0
 
-    for _, row in df_sorted.iterrows():
-        cost = row["cost_estimate"]
-        if cumulative + cost <= capex and row["score"] > 0:
+    for row in df_sorted.itertuples(index=False):
+        cost = row.cost_estimate
+        if cumulative + cost <= capex and row.score > 0:
             cumulative += cost
-            selected_ids.append(int(row["project_id"]))
+            selected_ids.append(int(row.project_id))
             trace.append({
-                "project_id": int(row["project_id"]),
+                "project_id": int(row.project_id),
                 "cost": float(cost),
-                "score": float(row["score"]),
-                "score_per_cost": float(row["score_per_cost"]),
+                "score": float(row.score),
+                "score_per_cost": float(row.score_per_cost),
                 "cumulative_cost": float(cumulative),
             })
 

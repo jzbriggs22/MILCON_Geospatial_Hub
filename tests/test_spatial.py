@@ -1,36 +1,39 @@
 """Tests for spatial / PostGIS logic.
 
 Verifies:
-- Constraint intersection detection works
-- Hazard proximity (ST_DWithin) is reflected in materialized views
-- Geometry types are correct
+- Proximity materialized views store true meter distances
+- Distance-0 pairs correspond to intersections
+- Geometry types and SRIDs are correct
+- No duplicate spatial indexes (regression: geoalchemy2 used to
+  auto-create a second GiST index per geometry column)
 """
 
 from __future__ import annotations
 
 from sqlalchemy import text
-import pytest
 
 
-def test_project_risk_view_has_severity(db_session):
-    """Projects near hazards should have max_hazard_severity > 0 in the MV."""
-    result = db_session.execute(text(
-        "SELECT COUNT(*) FROM project_risk_exposure WHERE max_hazard_severity > 0"
+def test_proximity_distances_within_radius(db_session):
+    """All materialized pairs must be within the 10 km cap."""
+    from app.analytics.queries import MAX_PROXIMITY_RADIUS_M
+
+    max_dist = db_session.execute(text(
+        "SELECT MAX(distance_m) FROM project_hazard_proximity"
     )).scalar()
-    # At least some projects should be near hazards given the synthetic data
-    # (this depends on spatial overlap which is probabilistic but highly likely
-    # with 200+ rows and overlapping regions)
-    # We just verify the view is queryable and returns plausible results
-    assert result >= 0  # non-negative; may be 0 if no spatial overlap
+    if max_dist is not None:
+        assert max_dist <= MAX_PROXIMITY_RADIUS_M
 
 
-def test_constraint_flags_binary(db_session):
-    """is_constrained should be 0 or 1."""
-    result = db_session.execute(text(
-        "SELECT DISTINCT is_constrained FROM project_constraint_flags ORDER BY 1"
-    )).fetchall()
-    values = {row[0] for row in result}
-    assert values.issubset({0, 1})
+def test_zero_distance_means_intersection(db_session):
+    """Pairs at distance 0 must actually intersect (geography semantics)."""
+    mismatches = db_session.execute(text(
+        "SELECT COUNT(*) FROM project_hazard_proximity phz "
+        "JOIN projects p ON p.id = phz.project_id "
+        "JOIN hazards h ON h.id = phz.hazard_id "
+        "WHERE phz.distance_m = 0 "
+        "AND NOT ST_Intersects(p.geometry, h.geometry)"
+    )).scalar()
+    assert mismatches == 0
 
 
 def test_installation_geometry_is_point(db_session):
@@ -51,16 +54,6 @@ def test_hazard_geometry_is_polygon(db_session):
     assert types == {"ST_Polygon"}
 
 
-def test_st_dwithin_detects_nearby(db_session):
-    """ST_DWithin should find at least one installation-hazard pair within 0.1 degrees."""
-    count = db_session.execute(text(
-        "SELECT COUNT(*) FROM installations i, hazards h "
-        "WHERE ST_DWithin(i.geometry, h.geometry, 0.1)"
-    )).scalar()
-    # With 5 regions, hazards placed within regions, this should be > 0
-    assert count >= 0  # structural test; overlap is probabilistic
-
-
 def test_srid_consistency(db_session):
     """All geometries should use SRID 4326."""
     tables = ["installations", "facilities", "projects", "hazards", "constraints"]
@@ -69,3 +62,31 @@ def test_srid_consistency(db_session):
             f"SELECT DISTINCT ST_SRID(geometry) FROM {table}"
         )).scalar()
         assert srid == 4326, f"Table {table} has SRID {srid}, expected 4326"
+
+
+def test_single_spatial_index_per_geometry_column(db_session):
+    """Each geometry column must carry exactly one GiST index."""
+    tables = ["installations", "facilities", "projects", "hazards", "constraints"]
+    for table in tables:
+        count = db_session.execute(text(
+            "SELECT COUNT(*) FROM pg_indexes "
+            "WHERE tablename = :t AND indexdef ILIKE '%USING gist%'"
+        ), {"t": table}).scalar()
+        assert count == 1, f"Table {table} has {count} GiST indexes, expected 1"
+
+
+def test_stale_view_detection(db_session):
+    """After refresh, every 2026 project appears in the factors query even
+    if it has no nearby hazard or constraint (LEFT JOIN semantics)."""
+    import pandas as pd
+    from app.analytics.queries import RAW_FACTORS_QUERY
+
+    n_projects = db_session.execute(text(
+        "SELECT COUNT(*) FROM projects WHERE year = 2026"
+    )).scalar()
+    df = pd.read_sql(
+        text(RAW_FACTORS_QUERY),
+        db_session.connection(),
+        params={"year": 2026, "hazard_buffer_m": 1000.0, "constraint_buffer_m": 0.0},
+    )
+    assert len(df) == n_projects

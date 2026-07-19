@@ -1,28 +1,30 @@
-"""SQLAlchemy engine and session factory."""
+"""SQLAlchemy engine and session factory.
+
+Engines are cached per database URL, so a caller passing an explicit URL
+(e.g. a test suite) gets its own engine without repointing other callers'
+default engine.
+"""
 
 from __future__ import annotations
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_database_url
 
-_engine = None
-_SessionLocal = None
+_engines: dict[str, Engine] = {}
 
 
-def get_engine(url: str | None = None):
-    global _engine
-    if _engine is None or url is not None:
-        _engine = create_engine(url or get_database_url(), echo=False, pool_pre_ping=True)
-    return _engine
+def get_engine(url: str | None = None) -> Engine:
+    resolved = url or get_database_url()
+    if resolved not in _engines:
+        _engines[resolved] = create_engine(resolved, echo=False, pool_pre_ping=True)
+    return _engines[resolved]
 
 
 def get_session_factory(url: str | None = None) -> sessionmaker[Session]:
-    global _SessionLocal
-    if _SessionLocal is None or url is not None:
-        _SessionLocal = sessionmaker(bind=get_engine(url), expire_on_commit=False)
-    return _SessionLocal
+    return sessionmaker(bind=get_engine(url), expire_on_commit=False)
 
 
 def get_session(url: str | None = None) -> Session:

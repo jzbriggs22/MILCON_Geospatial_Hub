@@ -5,6 +5,11 @@ Required views:
 2. Project ranking table — filters by region/category/year
 3. Scenario comparison — side-by-side metrics + project diff
 4. Explainability panel — factor contributions for a selected project
+
+Session handling: the engine is cached for the process, but every database
+operation opens a short-lived Session (context-managed).  A failed query
+therefore never leaves a poisoned transaction behind, and no connection is
+held idle-in-transaction between reruns.
 """
 
 from __future__ import annotations
@@ -16,15 +21,19 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 # Ensure project root is on sys.path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from app.config import SCENARIOS, AnalysisConfig
-from app.db.engine import get_session
-from app.analytics.scoring import score_projects
-from app.analytics.optimizer import optimize_budget
-from app.analytics.queries import INSTALLATION_SUMMARY_QUERY, PROJECT_LOCATIONS_QUERY
+from app.analytics.queries import INSTALLATION_SUMMARY_QUERY
+from app.analytics.run import run_analysis
+from app.config import SCENARIOS
+from app.db.engine import get_engine
+from app.maps.renderer import attach_project_locations, build_folium_map
+from streamlit_folium import st_folium
+
+YEARS = [2025, 2026, 2027, 2028]
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -40,43 +49,55 @@ st.caption("Infrastructure planning decision-support system — synthetic demo d
 
 
 # ---------------------------------------------------------------------------
-# Session / DB
+# DB access — cached engine, short-lived sessions
 # ---------------------------------------------------------------------------
 @st.cache_resource
-def _get_session():
-    return get_session()
+def _engine():
+    return get_engine()
 
 
-session = _get_session()
+@st.cache_data(ttl=300)
+def load_installations() -> pd.DataFrame:
+    with Session(_engine()) as session:
+        return pd.read_sql(text(INSTALLATION_SUMMARY_QUERY), session.connection())
+
+
+def _run(scenario: str, year: int):
+    """Run a full analysis in its own session; returns (scoring, optimization)."""
+    with Session(_engine()) as session:
+        scoring, optimization = run_analysis(session, scenario, year)
+        selected_with_loc = attach_project_locations(
+            session, optimization.selected_df, year
+        )
+    return scoring, optimization, selected_with_loc
+
 
 # ---------------------------------------------------------------------------
 # Sidebar controls
 # ---------------------------------------------------------------------------
 st.sidebar.header("Analysis Controls")
 scenario_name = st.sidebar.selectbox("Scenario", list(SCENARIOS.keys()))
-year = st.sidebar.selectbox("Fiscal Year", [2025, 2026, 2027, 2028], index=1)
+year = st.sidebar.selectbox("Fiscal Year", YEARS, index=1)
 run_btn = st.sidebar.button("Run Analysis", type="primary")
 
-# Store results in session_state
 if "scoring" not in st.session_state:
     st.session_state.scoring = None
     st.session_state.optimization = None
-    st.session_state.scenario_name = None
-    st.session_state.year = None
+    st.session_state.selected_with_loc = None
 
 if run_btn:
-    config = AnalysisConfig(scenario=scenario_name, year=year)
-    with st.spinner("Scoring projects ..."):
-        scoring = score_projects(session, config)
-    with st.spinner("Optimizing budget ..."):
-        optimization = optimize_budget(scoring)
-    st.session_state.scoring = scoring
-    st.session_state.optimization = optimization
-    st.session_state.scenario_name = scenario_name
-    st.session_state.year = year
+    try:
+        with st.spinner("Refreshing views, scoring, and optimizing ..."):
+            scoring, optimization, selected_with_loc = _run(scenario_name, year)
+        st.session_state.scoring = scoring
+        st.session_state.optimization = optimization
+        st.session_state.selected_with_loc = selected_with_loc
+    except Exception as exc:  # surface, don't poison future reruns
+        st.error(f"Analysis failed: {exc}")
 
 scoring = st.session_state.scoring
 optimization = st.session_state.optimization
+selected_with_loc = st.session_state.selected_with_loc
 
 # ---------------------------------------------------------------------------
 # Tab layout
@@ -88,37 +109,21 @@ tab_map, tab_table, tab_compare, tab_explain = st.tabs([
 # ===== TAB 1: MAP VIEW =====================================================
 with tab_map:
     st.subheader("Installation & Project Map")
-    if scoring is not None and not scoring.projects_df.empty:
-        # Get project locations
-        proj_locs = pd.read_sql(
-            text(PROJECT_LOCATIONS_QUERY),
-            session.connection(),
-            params={"year": st.session_state.year},
+    if scoring is None:
+        st.info("Run an analysis to overlay selected projects on the map.")
+
+    with Session(_engine()) as session:
+        m = build_folium_map(session, selected_with_loc)
+    st_folium(m, width=1000, height=600)
+
+    if optimization is not None:
+        col1, col2 = st.columns(2)
+        col1.metric("Selected Projects", len(optimization.selected_df))
+        col2.metric(
+            "Budget Utilization",
+            f"{optimization.total_cost / optimization.capex_limit * 100:.1f}%"
+            if optimization.capex_limit else "N/A",
         )
-        sel_ids = set(optimization.selected_df["project_id"].tolist())
-        sel_with_loc = optimization.selected_df.merge(
-            proj_locs[["id", "lon", "lat"]], left_on="project_id", right_on="id", how="left",
-        )
-
-        from app.maps.renderer import build_folium_map
-        m = build_folium_map(session, sel_with_loc, year=st.session_state.year)
-        from streamlit_folium import st_folium
-        st_folium(m, width=1000, height=600)
-
-        st.metric("Selected Projects", len(optimization.selected_df))
-        st.metric("Budget Utilization",
-                  f"{optimization.total_cost / optimization.capex_limit * 100:.1f}%"
-                  if optimization.capex_limit else "N/A")
-    else:
-        st.info("Run an analysis to see the map with selected projects.")
-
-        # Show base map anyway
-        inst_df = pd.read_sql(text(INSTALLATION_SUMMARY_QUERY), session.connection())
-        if not inst_df.empty:
-            from app.maps.renderer import build_folium_map
-            m = build_folium_map(session)
-            from streamlit_folium import st_folium
-            st_folium(m, width=1000, height=600)
 
 # ===== TAB 2: PROJECT RANKINGS =============================================
 with tab_table:
@@ -126,8 +131,7 @@ with tab_table:
     if scoring is not None and not scoring.projects_df.empty:
         ranked = scoring.ranked()
 
-        # Merge installation names
-        inst_df = pd.read_sql(text(INSTALLATION_SUMMARY_QUERY), session.connection())
+        inst_df = load_installations()
         inst_names = inst_df.set_index("id")["name"].to_dict()
         ranked["installation"] = ranked["installation_id"].map(inst_names)
 
@@ -176,36 +180,41 @@ with tab_compare:
     )
 
     col_a, col_b = st.columns(2)
-
     with col_a:
         sc_a = st.selectbox("Scenario A", list(SCENARIOS.keys()), key="sc_a")
-        yr_a = st.selectbox("Year A", [2025, 2026, 2027, 2028], index=1, key="yr_a")
+        yr_a = st.selectbox("Year A", YEARS, index=1, key="yr_a")
         run_a = st.button("Run A", key="run_a_btn")
-
     with col_b:
         sc_b = st.selectbox("Scenario B", list(SCENARIOS.keys()), index=1, key="sc_b")
-        yr_b = st.selectbox("Year B", [2025, 2026, 2027, 2028], index=1, key="yr_b")
+        yr_b = st.selectbox("Year B", YEARS, index=1, key="yr_b")
         run_b = st.button("Run B", key="run_b_btn")
 
     if "cmp_a" not in st.session_state:
         st.session_state.cmp_a = None
         st.session_state.cmp_b = None
 
-    if run_a:
-        cfg = AnalysisConfig(scenario=sc_a, year=yr_a)
-        s = score_projects(session, cfg)
-        o = optimize_budget(s)
-        st.session_state.cmp_a = (s, o)
-
-    if run_b:
-        cfg = AnalysisConfig(scenario=sc_b, year=yr_b)
-        s = score_projects(session, cfg)
-        o = optimize_budget(s)
-        st.session_state.cmp_b = (s, o)
+    try:
+        if run_a:
+            s, o, _ = _run(sc_a, yr_a)
+            st.session_state.cmp_a = (s, o)
+        if run_b:
+            s, o, _ = _run(sc_b, yr_b)
+            st.session_state.cmp_b = (s, o)
+    except Exception as exc:
+        st.error(f"Analysis failed: {exc}")
 
     if st.session_state.cmp_a and st.session_state.cmp_b:
         sa, oa = st.session_state.cmp_a
         sb, ob = st.session_state.cmp_b
+
+        if sa.config.year != sb.config.year:
+            st.warning(
+                "The two runs analyze different fiscal years, i.e. different "
+                "project cohorts. ROI is normalized within each cohort, so "
+                "Total/Median Score are NOT directly comparable across the "
+                "columns — compare selection diffs, costs, and utilization "
+                "instead."
+            )
 
         metrics = pd.DataFrame({
             "Metric": [
@@ -244,26 +253,19 @@ with tab_compare:
         # Project diff
         ids_a = set(oa.selected_df["project_id"])
         ids_b = set(ob.selected_df["project_id"])
-        only_a = ids_a - ids_b
-        only_b = ids_b - ids_a
-        common = ids_a & ids_b
-
-        st.markdown(f"**Common selected:** {len(common)} projects")
-        st.markdown(f"**Only in {sa.config.scenario}:** {len(only_a)} projects")
-        st.markdown(f"**Only in {sb.config.scenario}:** {len(only_b)} projects")
+        st.markdown(f"**Common selected:** {len(ids_a & ids_b)} projects")
+        st.markdown(f"**Only in {sa.config.scenario}:** {len(ids_a - ids_b)} projects")
+        st.markdown(f"**Only in {sb.config.scenario}:** {len(ids_b - ids_a)} projects")
 
         # Weight comparison
-        wa = sa.weights
-        wb = sb.weights
+        wa, wb = sa.weights, sb.weights
+        weight_keys = ["w_readiness", "w_roi", "w_risk", "w_constraint",
+                       "hazard_severity_multiplier", "budget_multiplier",
+                       "constraint_buffer_m"]
         wdf = pd.DataFrame({
-            "Weight": ["w_readiness", "w_roi", "w_risk", "w_constraint",
-                       "hazard_severity_multiplier", "budget_multiplier"],
-            sa.config.scenario: [wa["w_readiness"], wa["w_roi"], wa["w_risk"],
-                                  wa["w_constraint"], wa["hazard_severity_multiplier"],
-                                  wa["budget_multiplier"]],
-            sb.config.scenario: [wb["w_readiness"], wb["w_roi"], wb["w_risk"],
-                                  wb["w_constraint"], wb["hazard_severity_multiplier"],
-                                  wb["budget_multiplier"]],
+            "Weight": weight_keys,
+            sa.config.scenario: [wa[k] for k in weight_keys],
+            sb.config.scenario: [wb[k] for k in weight_keys],
         })
         st.subheader("Weight Comparison")
         st.dataframe(wdf, use_container_width=True, hide_index=True)
@@ -320,8 +322,7 @@ with tab_explain:
                 "Direction": "↓ penalty",
             },
         ]
-        factor_df = pd.DataFrame(factors)
-        st.dataframe(factor_df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(factors), use_container_width=True, hide_index=True)
 
         st.metric("Final Score", f"{row['score']:.4f}")
         st.markdown("**Formula:**")

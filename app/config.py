@@ -8,7 +8,7 @@ so that any scoring result can be traced back to these values.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -22,15 +22,24 @@ def get_database_url() -> str:
 # ---------------------------------------------------------------------------
 # Scenario weight configurations
 # ---------------------------------------------------------------------------
-# Each scenario defines multiplicative weights applied to the scoring
-# factors.  The multi-objective score formula is:
+# Each scenario defines weights applied to the scoring factors.  The
+# multi-objective score formula is:
 #
 #   score = w_readiness * readiness_gap_norm
 #         + w_roi       * roi_norm
 #         - w_risk      * hazard_exposure_norm
 #         - w_constraint * constraint_penalty_norm
 #
-# Normalization is min-max over the project set so all factors ∈ [0, 1].
+# Normalization: readiness gap, hazard exposure, and constraint penalty are
+# anchored to their table-constrained domains ([0,100], [0,10], count/5); ROI
+# is min-max normalized within the run's cohort (no natural upper bound).
+# See app/analytics/scoring.py for the exact formulas.
+#
+# hazard_severity_multiplier scales exposure against the fixed [0,10] severity
+# domain (clipped at 1.0), so it genuinely changes normalized risk.
+# constraint_buffer_m is passed as a bind parameter to the scoring query:
+# projects within that many meters of a constraint polygon are flagged
+# (0 = plain intersection).
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -110,12 +119,14 @@ class AnalysisConfig:
     """Top-level knobs for a single analysis run.
 
     Stored verbatim in every report so auditors can reproduce results.
+    Every field here is passed to the scoring pipeline — there are no
+    decorative parameters.
     """
     scenario: str
     year: int
-    hazard_buffer_m: float = 1000.0  # meters — proximity threshold
-    srid: int = 4326
-    seed: int = 42
+    # Hazard proximity radius in meters, bound into the scoring query.
+    # Must not exceed queries.MAX_PROXIMITY_RADIUS_M (10 km).
+    hazard_buffer_m: float = 1000.0
 
     @property
     def weights(self) -> ScenarioWeights:

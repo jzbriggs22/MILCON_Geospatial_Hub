@@ -9,6 +9,12 @@ Usage:
     from app.data.seed import seed_database
     seed_database(session, total_rows=2000, rng_seed=42)
 
+Idempotency:
+    seed_database() TRUNCATEs all demo tables (restarting identity
+    sequences) before inserting, so re-running it always yields the same
+    database state — including primary key values — for the same
+    (total_rows, rng_seed) pair.  It is safe to run on every startup.
+
 Audit note:
     Every random draw uses the numpy Generator seeded at entry.
     The same (total_rows, rng_seed) pair always produces identical data.
@@ -20,12 +26,14 @@ import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
-from shapely.geometry import Point, Polygon, box
 from geoalchemy2.shape import from_shape
+from shapely.geometry import Point, Polygon, box
+from sqlalchemy import text
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
+from app.db.maintenance import refresh_analytics_views
 from app.db.models import (
     Budget,
     Constraint,
@@ -62,6 +70,12 @@ HAZARD_TYPES = ["flood", "fire", "wind", "earthquake", "landslide"]
 
 CONSTRAINT_TYPES = ["no-build", "noise-zone", "protected-wetland", "historic-preservation"]
 
+# Tables owned by the seeder, in a single TRUNCATE (CASCADE handles FK order).
+SEEDED_TABLES = (
+    "isr_snapshots", "budgets", "constraints", "hazards",
+    "projects", "facilities", "installations",
+)
+
 
 def _random_point_in_bbox(
     rng: np.random.Generator,
@@ -89,11 +103,22 @@ def _random_polygon_near(
     )
 
 
+def clear_seeded_data(session: Session) -> None:
+    """Remove all seeded rows and reset identity sequences."""
+    session.execute(
+        text(f"TRUNCATE {', '.join(SEEDED_TABLES)} RESTART IDENTITY CASCADE")
+    )
+    session.commit()
+
+
 def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) -> dict[str, int]:
     """Populate the database with synthetic MILCON data.
 
-    Returns a dict of entity counts for logging.
+    Existing seeded data is cleared first (see module docstring), so this
+    is safe to re-run.  Returns a dict of entity counts for logging.
     """
+    clear_seeded_data(session)
+
     rng = np.random.default_rng(rng_seed)
 
     # ---- Proportions (roughly) ----
@@ -108,6 +133,7 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
 
     # ---- Installations ----
     installations: list[Installation] = []
+    installation_points: list[Point] = []
     for i in range(n_installations):
         region = region_names[i % len(region_names)]
         bbox = REGIONS[region]
@@ -119,21 +145,13 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
             geometry=from_shape(pt, srid=4326),
         )
         installations.append(inst)
+        installation_points.append(pt)
     session.add_all(installations)
     session.flush()  # get IDs
 
     # ---- Facilities ----
     facilities: list[Facility] = []
-    for inst in installations:
-        pt: Point = Point(
-            float(inst.geometry.desc.split("(")[1].split()[0]) if isinstance(inst.geometry, str)
-            else 0, 0
-        ) if False else None  # placeholder, we use inst coords below
-
-        # Extract coords from WKB via shapely
-        from geoalchemy2.shape import to_shape
-        inst_pt = to_shape(inst.geometry)
-
+    for inst, inst_pt in zip(installations, installation_points):
         for _ in range(rng.integers(n_facilities_per, n_facilities_per + 4)):
             fac_pt = Point(
                 inst_pt.x + rng.uniform(-0.01, 0.01),
@@ -141,7 +159,7 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
             )
             fac = Facility(
                 installation_id=inst.id,
-                type=rng.choice(FACILITY_TYPES),
+                type=str(rng.choice(FACILITY_TYPES)),
                 condition_index=round(float(rng.uniform(20, 100)), 1),
                 geometry=from_shape(fac_pt, srid=4326),
             )
@@ -150,8 +168,7 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
 
     # ---- Projects ----
     projects: list[Project] = []
-    for inst in installations:
-        inst_pt = to_shape(inst.geometry)
+    for inst, inst_pt in zip(installations, installation_points):
         for _ in range(rng.integers(n_projects_per, n_projects_per + 5)):
             cost = round(float(rng.uniform(500_000, 80_000_000)), -3)
             benefit = round(cost * float(rng.uniform(0.5, 3.0)), -3)
@@ -161,7 +178,7 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
             )
             proj = Project(
                 installation_id=inst.id,
-                category=rng.choice(PROJECT_CATEGORIES),
+                category=str(rng.choice(PROJECT_CATEGORIES)),
                 cost_estimate=cost,
                 benefit_estimate=benefit,
                 priority=int(rng.integers(1, 6)),
@@ -172,15 +189,23 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
     session.add_all(projects)
 
     # ---- Hazards ----
+    # Half the hazards are anchored near installations (hazards that matter
+    # for planning are the ones near bases — and this guarantees proximity
+    # pairs exist at any dataset size); the rest scatter across regions.
     hazards: list[Hazard] = []
-    for _ in range(n_hazards):
-        region = rng.choice(region_names)
-        bbox = REGIONS[region]
-        center_lon = float(rng.uniform(bbox[0], bbox[2]))
-        center_lat = float(rng.uniform(bbox[1], bbox[3]))
+    for h in range(n_hazards):
+        if h % 2 == 0:
+            anchor = installation_points[int(rng.integers(0, len(installation_points)))]
+            center_lon = anchor.x + float(rng.uniform(-0.01, 0.01))
+            center_lat = anchor.y + float(rng.uniform(-0.01, 0.01))
+        else:
+            region = str(rng.choice(region_names))
+            bbox = REGIONS[region]
+            center_lon = float(rng.uniform(bbox[0], bbox[2]))
+            center_lat = float(rng.uniform(bbox[1], bbox[3]))
         size = float(rng.uniform(0.01, 0.05))
         haz = Hazard(
-            type=rng.choice(HAZARD_TYPES),
+            type=str(rng.choice(HAZARD_TYPES)),
             severity=round(float(rng.uniform(1, 10)), 1),
             geometry=from_shape(
                 _random_polygon_near(rng, center_lon, center_lat, size),
@@ -191,15 +216,22 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
     session.add_all(hazards)
 
     # ---- Constraints ----
+    # Same anchoring split as hazards.
     constraints: list[Constraint] = []
-    for _ in range(n_constraints):
-        region = rng.choice(region_names)
-        bbox = REGIONS[region]
-        center_lon = float(rng.uniform(bbox[0], bbox[2]))
-        center_lat = float(rng.uniform(bbox[1], bbox[3]))
+    for c in range(n_constraints):
+        if c % 2 == 0:
+            anchor = installation_points[int(rng.integers(0, len(installation_points)))]
+            center_lon = anchor.x + float(rng.uniform(-0.01, 0.01))
+            center_lat = anchor.y + float(rng.uniform(-0.01, 0.01))
+        else:
+            region = str(rng.choice(region_names))
+            bbox = REGIONS[region]
+            center_lon = float(rng.uniform(bbox[0], bbox[2]))
+            center_lat = float(rng.uniform(bbox[1], bbox[3]))
+        ctype = str(rng.choice(CONSTRAINT_TYPES))
         con = Constraint(
-            type=rng.choice(CONSTRAINT_TYPES),
-            notes=f"Synthetic {rng.choice(CONSTRAINT_TYPES)} zone",
+            type=ctype,
+            notes=f"Synthetic {ctype} zone",
             geometry=from_shape(
                 _random_polygon_near(rng, center_lon, center_lat, float(rng.uniform(0.005, 0.03))),
                 srid=4326,
@@ -236,11 +268,7 @@ def seed_database(session: Session, total_rows: int = 2000, rng_seed: int = 42) 
 
     session.commit()
 
-    # Refresh materialized views
-    from sqlalchemy import text
-    session.execute(text("REFRESH MATERIALIZED VIEW project_risk_exposure"))
-    session.execute(text("REFRESH MATERIALIZED VIEW project_constraint_flags"))
-    session.commit()
+    refresh_analytics_views(session)
 
     counts = {
         "installations": len(installations),

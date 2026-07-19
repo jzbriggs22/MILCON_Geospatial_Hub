@@ -10,13 +10,15 @@ Each report run produces a directory under runs/<timestamp>/ containing:
 
 Auditability
 ============
-The audit_metadata.json file contains everything needed to reproduce
-the analysis:
-- AnalysisConfig (scenario, year, seed, buffer distances)
+audit_metadata.json contains everything needed to reproduce the analysis:
+- AnalysisConfig (scenario, year, hazard buffer)
 - ScenarioWeights (all weight values)
-- SQL query text and bind parameters
-- Normalization bounds (min/max for each factor)
-- Budget optimizer algorithm name and limitations
+- The SQL query text and the exact bind parameters passed to it —
+  every recorded parameter was actually applied; there are no
+  decorative entries
+- Normalization bounds per factor
+- Budget optimizer algorithm, limitations, and the COMPLETE
+  step-by-step selection trace
 """
 
 from __future__ import annotations
@@ -24,25 +26,23 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.analytics.optimizer import OptimizationResult
 from app.analytics.scoring import ScoringResult
-from app.config import AnalysisConfig
-from app.maps.renderer import export_static_map
+from app.maps.renderer import attach_project_locations, export_static_map
 
 
 def _save_score_distribution(df: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(df["score"], bins=30, color="steelblue", edgecolor="white", alpha=0.85)
-    ax.axvline(df["score"].median(), color="red", linestyle="--", label=f"Median: {df['score'].median():.3f}")
+    ax.axvline(df["score"].median(), color="red", linestyle="--",
+               label=f"Median: {df['score'].median():.3f}")
     ax.set_xlabel("Multi-Objective Score")
     ax.set_ylabel("Number of Projects")
     ax.set_title("Score Distribution")
@@ -105,18 +105,7 @@ def generate_report(
     _save_risk_exposure(df, output_dir / "risk_exposure.png")
 
     # --- Static map ---
-    # Merge lon/lat into selected projects
-    from app.analytics.queries import PROJECT_LOCATIONS_QUERY
-    from sqlalchemy import text as sa_text
-    proj_locs = pd.read_sql(
-        sa_text(PROJECT_LOCATIONS_QUERY),
-        session.connection(),
-        params={"year": config.year},
-    )
-    sel_with_loc = sel.merge(
-        proj_locs[["id", "lon", "lat"]],
-        left_on="project_id", right_on="id", how="left",
-    )
+    sel_with_loc = attach_project_locations(session, sel, config.year)
     export_static_map(session, sel_with_loc, output_dir / "project_map.png", year=config.year)
 
     # --- Audit metadata ---
@@ -126,8 +115,6 @@ def generate_report(
             "scenario": config.scenario,
             "year": config.year,
             "hazard_buffer_m": config.hazard_buffer_m,
-            "srid": config.srid,
-            "seed": config.seed,
         },
         "weights": scoring.weights,
         "sql_query": scoring.sql_query,
@@ -142,7 +129,7 @@ def generate_report(
             "projects_selected": len(optimization.selected_df),
             "projects_rejected": len(optimization.rejected_df),
         },
-        "selection_trace": optimization.selection_trace[:20],  # first 20 for brevity
+        "selection_trace": optimization.selection_trace,
     }
     (output_dir / "audit_metadata.json").write_text(json.dumps(audit, indent=2))
 
@@ -150,30 +137,37 @@ def generate_report(
     top10 = ranked.head(10)
     n_sel = len(sel)
     n_total = len(df)
-    utilization = (optimization.total_cost / optimization.capex_limit * 100) if optimization.capex_limit else 0
+    utilization = (
+        optimization.total_cost / optimization.capex_limit * 100
+        if optimization.capex_limit else 0
+    )
 
     md_lines = [
         f"# MILCON Analysis Report — {config.scenario}",
-        f"",
+        "",
         f"**Generated:** {ts}  ",
         f"**Scenario:** {config.scenario}  ",
         f"**Year:** FY{config.year}  ",
-        f"**Seed:** {config.seed}  ",
-        f"",
-        f"## Scenario Configuration",
-        f"",
-        f"| Parameter | Value |",
-        f"|-----------|-------|",
+        "",
+        "## Scenario Configuration",
+        "",
+        "All parameters below were applied to this run (buffers are bind",
+        "parameters of the SQL query; the multiplier scales exposure against",
+        "the fixed [0, 10] severity domain).",
+        "",
+        "| Parameter | Value |",
+        "|-----------|-------|",
         f"| w_readiness | {scoring.weights['w_readiness']} |",
         f"| w_roi | {scoring.weights['w_roi']} |",
         f"| w_risk | {scoring.weights['w_risk']} |",
         f"| w_constraint | {scoring.weights['w_constraint']} |",
         f"| hazard_severity_multiplier | {scoring.weights['hazard_severity_multiplier']} |",
         f"| budget_multiplier | {scoring.weights['budget_multiplier']} |",
+        f"| hazard_buffer_m | {config.hazard_buffer_m} |",
         f"| constraint_buffer_m | {scoring.weights['constraint_buffer_m']} |",
-        f"",
-        f"## Summary",
-        f"",
+        "",
+        "## Summary",
+        "",
         f"- **Projects evaluated:** {n_total}",
         f"- **Projects selected:** {n_sel}",
         f"- **Budget (capex limit):** ${optimization.capex_limit:,.0f}",
@@ -182,25 +176,25 @@ def generate_report(
         f"- **Total score of selected:** {optimization.total_score:.3f}",
         f"- **Median score (all):** {df['score'].median():.3f}",
         f"- **Optimizer:** {optimization.algorithm}",
-        f"",
-        f"## Score Distribution",
-        f"",
-        f"![Score Distribution](score_distribution.png)",
-        f"",
-        f"## Budget Utilization",
-        f"",
-        f"![Budget Spend](budget_spend.png)",
-        f"",
-        f"## Risk Exposure",
-        f"",
-        f"![Risk Exposure](risk_exposure.png)",
-        f"",
-        f"## Project Map",
-        f"",
-        f"![Project Map](project_map.png)",
-        f"",
-        f"## Top 10 Projects by Score",
-        f"",
+        "",
+        "## Score Distribution",
+        "",
+        "![Score Distribution](score_distribution.png)",
+        "",
+        "## Budget Utilization",
+        "",
+        "![Budget Spend](budget_spend.png)",
+        "",
+        "## Risk Exposure",
+        "",
+        "![Risk Exposure](risk_exposure.png)",
+        "",
+        "## Project Map",
+        "",
+        "![Project Map](project_map.png)",
+        "",
+        "## Top 10 Projects by Score",
+        "",
     ]
 
     if not top10.empty:
@@ -214,34 +208,38 @@ def generate_report(
             )
 
     md_lines += [
-        f"",
-        f"## Optimizer Notes",
-        f"",
+        "",
+        "## Optimizer Notes",
+        "",
         f"**Algorithm:** {optimization.algorithm}  ",
         f"**Limitations:** {optimization.limitations}",
-        f"",
-        f"## SQL Query Reference",
-        f"",
-        f"The raw factor query executed against PostGIS:",
-        f"",
-        f"```sql",
+        "",
+        "## SQL Query Reference",
+        "",
+        "The raw factor query executed against PostGIS:",
+        "",
+        "```sql",
         scoring.sql_query.strip(),
-        f"```",
-        f"",
+        "```",
+        "",
         f"**Parameters:** `{scoring.sql_params}`",
-        f"",
-        f"## Normalization Bounds",
-        f"",
-        f"| Factor | Min | Max |",
-        f"|--------|-----|-----|",
+        "",
+        "## Normalization Bounds",
+        "",
+        "Readiness gap, hazard exposure, and constraint penalty are anchored",
+        "to fixed domains; ROI is min-max normalized within this run's cohort",
+        "(so ROI-derived scores are comparable only within this run).",
+        "",
+        "| Factor | Min | Max |",
+        "|--------|-----|-----|",
     ]
     for factor, bnd in scoring.normalization_bounds.items():
         md_lines.append(f"| {factor} | {bnd['min']:.4f} | {bnd['max']:.4f} |")
 
     md_lines += [
-        f"",
-        f"---",
-        f"*Full audit metadata: [audit_metadata.json](audit_metadata.json)*",
+        "",
+        "---",
+        "*Full audit metadata: [audit_metadata.json](audit_metadata.json)*",
     ]
 
     (output_dir / "report.md").write_text("\n".join(md_lines))
