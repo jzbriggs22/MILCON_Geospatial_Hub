@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "milcon-geospatial-hub"
+version = "0.1.0"
+description = "MILCON-style geospatial decision-support system for infrastructure planning"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0,<3.0",
+    "geoalchemy2>=0.14,<1.0",
+    "psycopg2-binary>=2.9,<3.0",
+    "alembic>=1.13,<2.0",
+    "shapely>=2.0,<3.0",
+    "click>=8.1,<9.0",
+    "streamlit>=1.30,<2.0",
+    "folium>=0.15,<1.0",
+    "streamlit-folium>=0.18,<1.0",
+    "matplotlib>=3.8,<4.0",
+    "pandas>=2.1,<3.0",
+    "numpy>=1.26,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4,<9.0",
+    "pytest-cov>=4.1,<6.0",
+]
+
+[project.scripts]
+milcon = "app.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
